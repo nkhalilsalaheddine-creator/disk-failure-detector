@@ -1,0 +1,90 @@
+================================================================
+DISK FAILURE DETECTOR — ARCHITECTURE & DESIGN NOTES
+================================================================
+
+PROJECT GOAL
+------------
+Predict hard disk failures using live SMART diagnostic data
+fed into a trained Random Forest classifier.
+
+
+FULL PIPELINE
+-------------
+
+1. DATA ACQUISITION  (training/notebooks/dataset_acquisition.ipynb)
+   - Source: Backblaze Hard Drive Dataset (quarterly CSV dumps)
+   - Each CSV = one day snapshot of all monitored disks
+   - Problem: massive class imbalance (~0.05% failure rate)
+   - Solution:
+       * Collect ALL failure=1 rows across full year → 4,414 rows
+       * Randomly sample failure=0 rows (cap 20 per file) → 4,414 rows
+       * Shuffle and save → model_ready_data.csv (8,828 rows, 50/50)
+
+2. PREPROCESSING  (training/notebooks/smart_scan_classifier.ipynb)
+   a. Column filtering      — drop columns with >30% NaN (unless required)
+   b. Drop irrelevants      — location metadata, date, serial_number
+   c. Drop normalized cols  — manufacturer-specific, inconsistent (57 brands)
+   d. Encode disk type      — is_ssd flag (1=SSD, 0=HDD)
+   e. Encode manufacturer   — map model strings to brand groups
+   f. Domain-aware NaN fill:
+        error counters      → 0
+        temperature         → median
+        mechanical columns  → SSD=0, HDD=median
+        power cycles        → median
+        critical SMART flags→ 0
+   g. Feature engineering:
+        any_critical_error  = 1 if any of smart_5/187/197/198 > 0
+        total_error_count   = sum of smart_5 + 187 + 197 + 198
+        error_per_gb        = total_error_count / capacity_gigabytes
+   h. Drop low-signal cols  — smart_190, 194, 199, 10 (near-zero correlation)
+
+3. MODEL TRAINING
+   - Algorithm: Random Forest Classifier (sklearn)
+   - Optimization: GridSearchCV (f1 scoring, cv=3)
+     Params searched: n_estimators, max_depth, min_samples_split, class_weight
+   - Validation: 5-fold cross-validation
+   - Output: disk_model.pkl, feature_importance.csv
+
+4. APPLICATION  (app/)
+   - scanner.py     → runs smartctl -a --json via subprocess, parses output
+                       into a single DataFrame row matching model features
+   - predictor.py   → loads disk_model.pkl, aligns features to
+                       model.feature_names_in_, returns label + confidence
+                       + per-feature breakdown
+   - main_window.py → PyQt6 two-page UI
+                       Page 0: disk selection (auto-detect via smartctl --scan)
+                       Page 1: result badge + confidence bar + breakdown table
+   - main.py        → entry point, loads model, launches Qt app
+
+
+MODEL FEATURES (in training order)
+-----------------------------------
+capacity_gigabytes, smart_1_raw, smart_3_raw, smart_4_raw,
+smart_5_raw, smart_7_raw, smart_9_raw, smart_12_raw,
+smart_187_raw, smart_188_raw, smart_191_raw, smart_192_raw,
+smart_193_raw, smart_197_raw, smart_198_raw,
+is_ssd, any_critical_error, total_error_count, error_per_gb
+
+Total: 19 features
+
+
+MODEL RESULTS
+-------------
+Accuracy:           90.29%
+Precision (fail):   93%
+Recall (fail):      87%      ← priority metric (missed failures = data loss)
+F1 (fail):          90%
+
+Key finding: any_critical_error has 0.75 correlation with failure —
+the single strongest predictor in the dataset.
+
+
+KNOWN LIMITATIONS & TODO
+-------------------------
+- Failure recall at 87% means ~13% of real failures are missed
+  → Try: lower decision threshold below 0.5
+  → Try: tune class_weight='balanced' more aggressively
+- No scan history / logging yet (each scan is stateless)
+- smartmontools must be installed separately on the host
+- model.pkl not versioned — retrain may break feature alignment
+  (predictor.py reads model.feature_names_in_ directly to avoid this)
